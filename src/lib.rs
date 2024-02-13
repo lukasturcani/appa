@@ -8,10 +8,10 @@ use std::{
 pub enum Error {
     #[error("IO error")]
     Io(#[source] std::io::Error),
-    #[error("error parsing int")]
-    ParseInt(#[source] std::num::ParseIntError),
-    #[error("error parsing float")]
-    ParseFloat(#[source] std::num::ParseFloatError),
+    #[error("error parsing int: {1}")]
+    ParseInt(#[source] std::num::ParseIntError, String),
+    #[error("error parsing float: {1}")]
+    ParseFloat(#[source] std::num::ParseFloatError, String),
     #[error("error parsing molecule: {0}")]
     ParseFile(String),
 }
@@ -25,12 +25,14 @@ pub struct Molecule {
     pub aromatic_bonds: Option<AromaticBonds>,
 }
 
+#[derive(Debug)]
 pub struct Bonds {
     pub atoms1: Vec<u32>,
     pub atoms2: Vec<u32>,
-    pub order: Vec<u8>,
+    pub orders: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct AromaticBonds {
     pub atoms1: Vec<u32>,
     pub atoms2: Vec<u32>,
@@ -42,9 +44,9 @@ pub struct ReadMolFileV2000 {
 }
 
 pub struct MolFileV2000Data {
-    title: String,
-    molecule: Molecule,
-    properties: Vec<Property>,
+    pub title: String,
+    pub molecule: Molecule,
+    pub properties: Vec<Property>,
 }
 
 pub struct Property {
@@ -66,7 +68,7 @@ impl Iterator for ReadMolFileV2000 {
                 }
             }
         }
-        self.next()?; // drop empty line
+        self.lines.next()?; // drop empty line
         let title = match self.lines.next()? {
             Ok(title) => title,
             Err(err) => {
@@ -74,7 +76,7 @@ impl Iterator for ReadMolFileV2000 {
                 return Some(Err(Error::Io(err)));
             }
         };
-        self.next()?; // drop empty line
+        self.lines.next()?; // drop empty line
         let counts = match self.lines.next()? {
             Ok(counts) => counts,
             Err(err) => {
@@ -82,22 +84,27 @@ impl Iterator for ReadMolFileV2000 {
                 return Some(Err(Error::Io(err)));
             }
         };
-        let num_atoms = match counts[0..3].parse::<u16>() {
+        let num_atoms = match counts[0..3].trim().parse::<u16>() {
             Ok(num_atoms) => num_atoms,
             Err(err) => {
                 self.seek_block_end = true;
-                return Some(Err(Error::ParseInt(err)));
+                return Some(Err(Error::ParseInt(
+                    err,
+                    format!(r#""{}" in line "{}""#, &counts[0..3], counts),
+                )));
             }
         };
-        let num_bonds = match counts[3..6].parse::<u16>() {
+        let num_bonds = match counts[3..6].trim().parse::<u16>() {
             Ok(num_bonds) => num_bonds,
             Err(err) => {
                 self.seek_block_end = true;
-                return Some(Err(Error::ParseInt(err)));
+                return Some(Err(Error::ParseInt(
+                    err,
+                    format!(r#""{}" in line "{}""#, &counts[3..6], counts),
+                )));
             }
         };
         let mut atomic_numbers = Vec::with_capacity(num_atoms as usize);
-        let mut atom_charges = Vec::with_capacity(num_atoms as usize);
         let mut atom_coordinates = Vec::with_capacity(num_atoms as usize);
         for _ in 0..num_atoms {
             let line = self.lines.next()?;
@@ -108,25 +115,34 @@ impl Iterator for ReadMolFileV2000 {
                     return Some(Err(Error::Io(err)));
                 }
             };
-            let x = match line[0..10].parse::<f32>() {
+            let x = match line[0..10].trim().parse::<f32>() {
                 Ok(x) => x,
                 Err(err) => {
                     self.seek_block_end = true;
-                    return Some(Err(Error::ParseFloat(err)));
+                    return Some(Err(Error::ParseFloat(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[0..10], line),
+                    )));
                 }
             };
-            let y = match line[10..20].parse::<f32>() {
+            let y = match line[10..20].trim().parse::<f32>() {
                 Ok(y) => y,
                 Err(err) => {
                     self.seek_block_end = true;
-                    return Some(Err(Error::ParseFloat(err)));
+                    return Some(Err(Error::ParseFloat(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[10..20], line),
+                    )));
                 }
             };
-            let z = match line[20..30].parse::<f32>() {
+            let z = match line[20..30].trim().parse::<f32>() {
                 Ok(z) => z,
                 Err(err) => {
                     self.seek_block_end = true;
-                    return Some(Err(Error::ParseFloat(err)));
+                    return Some(Err(Error::ParseFloat(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[20..30], line),
+                    )));
                 }
             };
             let atomic_number = match atomic_number_from_str(&line[31..34]) {
@@ -136,24 +152,107 @@ impl Iterator for ReadMolFileV2000 {
                     return Some(Err(err));
                 }
             };
-            let atom_charge = match line[36..39].parse::<i8>() {
-                Ok(atom_charge) => atom_charge,
+            atomic_numbers.push(atomic_number);
+            atom_coordinates.push([x, y, z]);
+        }
+        let mut atoms1 = Vec::with_capacity(num_bonds as usize);
+        let mut atoms2 = Vec::with_capacity(num_bonds as usize);
+        let mut orders = Vec::with_capacity(num_bonds as usize);
+        for _ in 0..num_bonds {
+            let line = self.lines.next()?;
+            let line = match line {
+                Ok(line) => line,
                 Err(err) => {
                     self.seek_block_end = true;
-                    return Some(Err(Error::ParseInt(err)));
+                    return Some(Err(Error::Io(err)));
                 }
             };
-            atomic_numbers.push(atomic_number);
-            atom_charges.push(atom_charge);
-            atom_coordinates.push([x, y, z]);
+            let atom1 = match line[0..3].trim().parse::<u32>() {
+                Ok(atom1) => atom1,
+                Err(err) => {
+                    self.seek_block_end = true;
+                    return Some(Err(Error::ParseInt(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[0..3], line),
+                    )));
+                }
+            };
+            let atom2 = match line[3..6].trim().parse::<u32>() {
+                Ok(atom2) => atom2,
+                Err(err) => {
+                    self.seek_block_end = true;
+                    return Some(Err(Error::ParseInt(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[3..6], line),
+                    )));
+                }
+            };
+            let order = match line[6..9].trim().parse::<u8>() {
+                Ok(order) => order,
+                Err(err) => {
+                    self.seek_block_end = true;
+                    return Some(Err(Error::ParseInt(
+                        err,
+                        format!(r#""{}" in line "{}""#, &line[6..9], line),
+                    )));
+                }
+            };
+            atoms1.push(atom1);
+            atoms2.push(atom2);
+            orders.push(order);
+        }
+        let mut atom_charges = None;
+        while let Some(line) = self.lines.next() {
+            match line {
+                Ok(line) => {
+                    if line == "M END" {
+                        break;
+                    }
+                    if &line[3..6] == "CHG" {
+                        if atom_charges.is_none() {
+                            atom_charges = Some(vec![0; num_atoms as usize]);
+                        }
+                        let atom = match line[8..11].trim().parse::<u16>() {
+                            Ok(atom) => atom,
+                            Err(err) => {
+                                self.seek_block_end = true;
+                                return Some(Err(Error::ParseInt(
+                                    err,
+                                    format!(r#""{}" in line "{}""#, &line[8..11], line),
+                                )));
+                            }
+                        };
+                        let charge = match line[12..15].trim().parse::<i8>() {
+                            Ok(charge) => charge,
+                            Err(err) => {
+                                self.seek_block_end = true;
+                                return Some(Err(Error::ParseInt(
+                                    err,
+                                    format!(r#""{}" in line "{}""#, &line[12..15], line),
+                                )));
+                            }
+                        };
+                        let atom_charges = atom_charges.as_mut().unwrap();
+                        atom_charges[atom as usize - 1] = charge;
+                    }
+                }
+                Err(err) => {
+                    self.seek_block_end = true;
+                    return Some(Err(Error::Io(err)));
+                }
+            }
         }
         Some(Ok(MolFileV2000Data {
             title,
             molecule: Molecule {
                 atomic_numbers,
-                atom_charges: Some(atom_charges),
+                atom_charges,
                 atom_coordinates: Some(atom_coordinates),
-                integer_bonds: None,
+                integer_bonds: Some(Bonds {
+                    atoms1,
+                    atoms2,
+                    orders,
+                }),
                 dative_bonds: None,
                 aromatic_bonds: None,
             },
@@ -162,7 +261,7 @@ impl Iterator for ReadMolFileV2000 {
     }
 }
 
-pub fn read_mol_file_v2000(path: &Path) -> Result<ReadMolFileV2000, Error> {
+pub fn read_v2000_mol_file(path: &Path) -> Result<ReadMolFileV2000, Error> {
     Ok(ReadMolFileV2000 {
         lines: BufReader::new(File::open(path).map_err(Error::Io)?).lines(),
         seek_block_end: false,
@@ -299,7 +398,8 @@ mod tests {
 
     #[test]
     fn it_works() {
-        for data in read_mol_file_v2000(Path::new("/home/lukas/data/ChEBI_complete.sdf"))
+        return;
+        for data in read_v2000_mol_file(Path::new("/home/lukas/data/ChEBI_complete.sdf"))
             .unwrap()
             .filter_map(Result::ok)
         {
